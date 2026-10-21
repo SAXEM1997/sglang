@@ -214,6 +214,18 @@ def test_stream_keys_separate_scratch_and_routes(monkeypatch):
     assert build.call_count == 5
 
 
+def test_side_stream_skips_caller_alias_and_reuses_the_cached_stream(monkeypatch):
+    workspace = Workspace()
+    device = torch.device("cuda:0")
+    caller, side = SimpleNamespace(cuda_stream=11), SimpleNamespace(cuda_stream=22)
+    streams = Mock(side_effect=[caller, side])
+    monkeypatch.setattr(workspace, "_caller", lambda _: caller.cuda_stream)
+    monkeypatch.setattr(torch.cuda, "Stream", streams)
+    assert workspace.side_stream(device) is side
+    assert workspace.side_stream(device) is side
+    assert streams.call_count == 2
+
+
 def test_cpu_parallel_region_is_joined_before_return():
     workspace = Workspace()
     order = []

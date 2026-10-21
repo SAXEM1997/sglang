@@ -313,6 +313,71 @@ def _tree(path):
     return ast.parse((ROOT / path).read_text())
 
 
+def _runner_constructor(cuda):
+    tree = _tree("lora/dense/runner.py")
+    runner = next(
+        node for node in tree.body if getattr(node, "name", None) == "DenseLoraRunner"
+    )
+    init = next(
+        node for node in runner.body if getattr(node, "name", None) == "__init__"
+    )
+    mapping = _tree("lora/utils.py")
+    capability = next(
+        node
+        for node in mapping.body
+        if getattr(node, "name", None) == "architecture_for_capability"
+    )
+    namespace = {"torch": SimpleNamespace(cuda=cuda), "load_plans": Mock()}
+    module = ast.Module(
+        body=[*ast.parse("from __future__ import annotations").body, capability, init],
+        type_ignores=[],
+    )
+    exec(compile(module, "runner_constructor", "exec"), namespace)
+    return namespace["__init__"], namespace["load_plans"]
+
+
+@pytest.mark.parametrize(
+    "major,override,expected",
+    [
+        (8, None, "default"),
+        (9, None, "sm90"),
+        (10, None, "sm100"),
+        (9, "sm100", "sm100"),
+    ],
+)
+def test_runner_resolves_architecture_from_the_device_unless_overridden(
+    major, override, expected
+):
+    cuda = SimpleNamespace(get_device_capability=Mock(return_value=(major, 0)))
+    init, load_plans = _runner_constructor(cuda)
+    device = SimpleNamespace(type="cuda", index=0)
+    runner = SimpleNamespace(reset=Mock())
+    init(runner, object(), max_loras=4, device=device, architecture=override)
+    if override is None:
+        cuda.get_device_capability.assert_called_once_with(device)
+    else:
+        cuda.get_device_capability.assert_not_called()
+    assert runner.architecture == expected
+    # The table (and any override) is validated when the runner is built.
+    load_plans.assert_called_once_with(runner.architecture)
+
+
+@pytest.mark.parametrize("override", [None, "sm90"])
+def test_cpu_runner_does_not_query_cuda_metadata(override):
+    cuda = SimpleNamespace(get_device_capability=Mock())
+    init, _ = _runner_constructor(cuda)
+    runner = SimpleNamespace(reset=Mock())
+    init(
+        runner,
+        object(),
+        max_loras=4,
+        device=SimpleNamespace(type="cpu"),
+        architecture=override,
+    )
+    cuda.get_device_capability.assert_not_called()
+    assert runner.architecture == ("default" if override is None else override)
+
+
 def _geometry_host_function(name, **scope):
     path = ROOT.parent / "kernels/ops/lora/common/lora_b.py"
     node = next(
