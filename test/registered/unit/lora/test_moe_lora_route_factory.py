@@ -246,5 +246,108 @@ def test_cpu_parallel_region_is_joined_before_return():
     assert order == ["side", "compute"]
 
 
+def test_route_cache_keys_match_mapping_and_options():
+    workspace = Workspace()
+    slots = torch.arange(32, dtype=torch.int32) % 4
+    key, build = ("sorted", 16, 4), Mock(side_effect=object)
+    first = workspace.route(slots, key, build)
+    assert workspace.route(slots[:], key, build) is first
+    build.assert_called_once_with()
+    for mapping, options in (
+        (slots.clone(), key),
+        (slots[:16], key),
+        (slots[1:17], key),
+        (slots[::2], key),
+        (slots.view(torch.float32), key),
+        (slots, ("sorted", 32, 4)),
+        (slots, ("sorted", 16, 8)),
+    ):
+        build.reset_mock()
+        route = workspace.route(mapping, options, build)
+        assert workspace.route(mapping, options, build) is route
+        build.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "requested,parallel,joins",
+    [
+        (("RAW_PER_EXPERT", "RAW_SHARED_OUTER", "SHARED_TOKEN_PLAN"), False, False),
+        (("ALIGNED_PER_EXPERT", "ALIGNED_SHARED_OUTER"), False, False),
+        (("ALIGNED_PER_EXPERT", "ALIGNED_SHARED_OUTER"), True, True),
+        (("ALIGNED_PER_EXPERT",), True, False),
+        (("ALIGNED_SHARED_OUTER",), True, False),
+    ],
+)
+def test_moe_route_bundle_builds_only_requested_products(
+    monkeypatch, requested, parallel, joins
+):
+    from sglang.srt.lora.moe import routing as moe_routing
+    from sglang.srt.lora.moe.plan import RouteBuilderFamily, RouteRequirement
+
+    slots = torch.tensor([0, 1, -1], dtype=torch.int32)
+    topk = torch.tensor([[0, 2], [1, 0], [-1, 2]], dtype=torch.int32)
+    workspace = Workspace()
+    join = Mock(wraps=workspace.run_parallel)
+    monkeypatch.setattr(workspace, "run_parallel", join)
+
+    built = {}
+
+    def build(mapping, **kwargs):
+        route = object()
+        built[route] = mapping, kwargs
+        return route
+
+    monkeypatch.setattr(moe_routing, "build_route", build)
+    plan = SimpleNamespace(
+        route_requirements=lambda: {RouteRequirement[name] for name in requested},
+        route_builder=(
+            RouteBuilderFamily.PARALLEL_SHARED_OUTER
+            if parallel
+            else RouteBuilderFamily.STANDARD
+        ),
+    )
+
+    def routes():
+        return moe_routing.build_moe_routes(
+            plan,
+            topk_ids=topk,
+            token_lora_mapping=slots,
+            num_local_experts=3,
+            max_loras=2,
+            block_size=16,
+            workspace=workspace,
+        )
+
+    first = routes()
+    assert len(built) == len(requested)
+    assert join.call_count == int(joins)
+    if joins:
+        assert list(built) == [first.aligned_shared_outer, first.aligned_per_expert]
+    for requirement in RouteRequirement:
+        name = requirement.name
+        field = name.lower().removesuffix("_plan")
+        route = getattr(first, field)
+        assert (route is not None) == (name in requested)
+        if route is not None:
+            mapping, args = built[route]
+            assert mapping is slots
+            assert args["view"].value == (
+                "raw" if name.startswith("RAW_") else "aligned"
+            )
+            assert args.get("group_ids") is (
+                None if name == "SHARED_TOKEN_PLAN" else topk
+            )
+            assert args.get("groups_per_slot", 1) == (
+                3 if name.endswith("PER_EXPERT") else 1
+            )
+            assert (args["max_loras"], args["block_size"]) == (2, 16)
+            if name.startswith("ALIGNED_"):
+                assert args["tensor_prefix"] == f"route:{field}"
+    if first.shared_token is not None:
+        topk.add_(1)
+        assert routes().shared_token is first.shared_token
+        assert len(built) == 2 * len(requested) - 1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
