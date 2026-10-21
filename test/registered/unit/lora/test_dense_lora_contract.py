@@ -34,6 +34,16 @@ def plan_config(tmp_path, monkeypatch):
         plan_module.load_plans.cache_clear()
 
 
+@pytest.fixture
+def shipped_plans(monkeypatch):
+    monkeypatch.delenv("SGLANG_LORA_DENSE_CONFIG_DIR", raising=False)
+    plan_module.load_plans.cache_clear()
+    try:
+        yield
+    finally:
+        plan_module.load_plans.cache_clear()
+
+
 def test_plan_rejects_incompatible_families():
     with pytest.raises(ValueError, match="all_slots"):
         DensePlan(a_family=AFamily.ALL_SLOTS, b_family=BFamily.GROUPED)
@@ -222,6 +232,22 @@ def test_geometry_rows_do_not_leak_to_neighboring_sites(plan_config):
         )
 
 
+@pytest.mark.parametrize("architecture", ["default", "sm90", "sm100"])
+@pytest.mark.parametrize("phase", [Phase.DECODE, Phase.PREFILL])
+@pytest.mark.parametrize("kind", [DenseLoraKind.EMBEDDING, DenseLoraKind.LM_HEAD])
+def test_shipped_vocab_plans_keep_the_supported_execution_contract(
+    shipped_plans, architecture, phase, kind
+):
+    for rank, tokens, k, n in ((8, 1, 256, 131), (128, 1024, 2048, 65536)):
+        table = DensePlanTable(architecture, max_rank=rank)
+        plan = table.plan_for(kind, phase, tokens, k, n)
+        assert plan.a_family is AFamily.GROUPED
+        assert plan.b_family is BFamily.GROUPED
+        assert plan.overlap is Overlap.NONE
+    assert plan == table.plan_for(kind, phase, tokens, k, 0)
+    assert plan == table.plan_for(kind, phase, tokens, 0, n)
+
+
 def test_table_rejects_all_slots_rows_that_name_sink_down():
     row = {
         "name": "decode.sink_down",
@@ -262,6 +288,22 @@ def test_windowed_sites_skip_all_slots_rows(plan_config):
     assert sink.a_family is AFamily.GROUPED
     assert sink.block_size == 32 and sink.overlap is Overlap.AB_DELTA
     assert table.plan_for(DenseLoraKind.LINEAR, Phase.DECODE, 17) == sink
+
+
+def test_shipped_h200_table_serial_in_proj_exceptions(shipped_plans):
+    tables = {rank: DensePlanTable("sm90", max_rank=rank) for rank in (64, 65)}
+    for rank, tokens, k, n, block_size in (
+        (64, 2048, 2048, 12288, 16),
+        (64, 2049, 2048, 12288, 64),
+        (65, 2048, 2048, 12288, 32),
+        (64, 2048, 2047, 12288, 64),
+        (64, 2048, 2049, 12288, 64),
+        (64, 2048, 2048, 12287, 64),
+        (64, 2048, 2048, 12289, 64),
+    ):
+        plan = tables[rank].plan_for(DenseLoraKind.LINEAR, Phase.PREFILL, tokens, k, n)
+        assert plan.block_size == block_size
+        assert plan.overlap is Overlap.NONE
 
 
 ROOT = Path(__file__).resolve().parents[4] / "python/sglang/srt"
