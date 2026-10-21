@@ -1,10 +1,17 @@
-"""Skip dense LoRA for adapter-free batches, except when capturing adapter graphs."""
+"""Skip dense LoRA for adapter-free batches, except when capturing adapter graphs.
+Decode uses the separate nolora graph variant for adapter-free batches.
+"""
 
 from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.triton_v2_backend import TritonV2LoRABackend
 from sglang.srt.lora.layers import BaseLayerWithLoRA
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    _lora_backend_skips_inactive,
+)
 from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -72,6 +79,16 @@ def test_inactive_batch_skips_dense_lora_outside_capture(capture):
 def test_capture_keeps_lora_except_for_the_nolora_variant(capture, variant, expected):
     capture(True, variant)
     assert _layer(False, skip_dense=True).lora_active is expected
+
+
+def test_backend_inactive_skip_capability():
+    assert not _lora_backend_skips_inactive(SimpleNamespace(lora_manager=None))
+    for backend, expected in ((BaseLoRABackend, False), (TritonV2LoRABackend, True)):
+        manager = SimpleNamespace(lora_backend=backend)
+        assert (
+            _lora_backend_skips_inactive(SimpleNamespace(lora_manager=manager))
+            is expected
+        )
 
 
 if __name__ == "__main__":
