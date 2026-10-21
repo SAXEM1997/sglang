@@ -10,6 +10,10 @@ import torch.nn.functional as F
 from sglang.srt.layers import linear, mova
 from sglang.srt.models.inkling_common import dense_mlp
 from sglang.srt.models.inkling_common.attn import InklingAttention
+from sglang.srt.models.inkling_common.lora import (
+    InklingBatchDenseMLPWithLoRA,
+    InklingBatchDenseMLPWithLoRAV2,
+)
 from sglang.srt.models.inkling_common.moe import _build_inkling_shared_experts
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -252,6 +256,46 @@ class TestCustomProjectionParallelGroups(CustomTestCase):
                         ]
                     )
                     torch.testing.assert_close(actual, reference)
+
+    def test_shared_factory_selects_an_unbound_sink(self):
+        for enabled, backend, expected in (
+            (False, "triton", dense_mlp.InklingBatchDenseMLP),
+            (True, "triton", InklingBatchDenseMLPWithLoRA),
+            (True, "triton_v2", InklingBatchDenseMLPWithLoRAV2),
+        ):
+            with self.subTest(enabled=enabled, backend=backend):
+                reset_context()
+                publish(
+                    ServerArgs(
+                        model_path="dummy",
+                        device="cpu",
+                        enable_lora=enabled,
+                        lora_backend=backend,
+                        lora_target_modules=["q_proj"],
+                    ),
+                    role="test",
+                )
+                with patch(
+                    "sglang.srt.models.inkling_common.moe.use_inkling_shared_fused_moe",
+                    return_value=False,
+                ):
+                    module = _build_inkling_shared_experts(
+                        n_shared_experts=2,
+                        shared_expert_sink=True,
+                        shared_experts_size=1,
+                        inference_moe_w13_interleaved=True,
+                        hidden_size=16,
+                        intermediate_size=32,
+                        layer_id=0,
+                        prefix="model.layers.0",
+                    )
+                self.assertIs(type(module), expected)
+                if enabled:
+                    self.assertFalse(module.set_lora)
+                    self.assertFalse(module.is_shared_fused_moe)
+                    self.assertEqual(
+                        module._w13_gate_up_contiguous, backend == "triton_v2"
+                    )
 
     def test_shared_factory_keeps_full_tp_and_execution_handle(self):
         publish(
